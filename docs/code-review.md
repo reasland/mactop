@@ -542,3 +542,225 @@ The label says `"Max %.1f C"` but uses `data[len(data)-1]` (the most recent valu
 ## Final Verdict
 
 **Approve with changes.** The stacked layout simplification is clean and the temperature graph integration is correct. The main issues are: the misleading graph label (#5 -- quick fix), the ignored `graphHeight` parameter (#3 -- interface consistency), the `Min: 0` scaling choice (#1 -- UX improvement), and missing test coverage (#2). None are blocking, but #3 and #5 should be addressed before this is considered complete.
+
+---
+---
+
+# Code Review: GitHub Actions Release Workflow
+
+**Date:** 2026-03-30
+**Reviewer:** Claude Opus 4.6
+**Scope:** `.github/workflows/release.yml` -- GitHub Actions workflow for building macOS binaries and creating GitHub Releases on version tags.
+**Verdict:** Approve with changes
+
+---
+
+## Summary
+
+The workflow is well-structured and follows a sensible single-job approach for building two architecture variants of a CGO-dependent macOS binary. The step ordering is correct, the version injection mechanism works, and the release action is configured properly. There are no correctness bugs that would cause silent failures. The issues found are primarily about hardening against supply-chain risks (unpinned third-party action), a minor robustness concern with the checksums step, and an unnecessary configuration option.
+
+---
+
+## Must Fix
+
+### 1. Third-party action `softprops/action-gh-release` is not pinned to a commit SHA
+
+**File:** `.github/workflows/release.yml`, line 44
+
+The action is referenced as `softprops/action-gh-release@v2`, which is a mutable tag. If the action's maintainer (or an attacker who compromises their account) pushes malicious code to the `v2` tag, the workflow will execute it with `contents: write` permissions -- enough to tamper with release assets or exfiltrate the `GITHUB_TOKEN`.
+
+The first-party actions (`actions/checkout@v4`, `actions/setup-go@v5`) carry lower risk because they are maintained by GitHub itself, but pinning them to SHA is still best practice.
+
+**Suggested fix:** Pin all actions to full commit SHAs, with a version comment for readability:
+
+```yaml
+- uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.7
+- uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
+- uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+```
+
+Then use Dependabot or Renovate to keep the SHAs updated. This is the standard supply-chain hardening recommendation from GitHub's own security documentation and is especially important for actions that run with write permissions.
+
+---
+
+## Should Fix
+
+### 2. `fetch-depth: 0` is unnecessary
+
+**File:** `.github/workflows/release.yml`, line 18
+
+`fetch-depth: 0` fetches the entire Git history. The workflow does not use `git log`, `git describe`, changelog generation from commit history, or any other operation that requires history beyond the tagged commit. The `GITHUB_REF_NAME` environment variable is provided by GitHub Actions itself and does not require local Git history. The `generate_release_notes: true` option in `softprops/action-gh-release` uses the GitHub API (not local Git history) to generate notes.
+
+The default `fetch-depth: 1` (shallow clone) is sufficient and will be faster, especially as the repository grows.
+
+**Suggested fix:** Remove the `with` block entirely from the checkout step, or explicitly set `fetch-depth: 1`:
+
+```yaml
+- name: Checkout
+  uses: actions/checkout@v4
+```
+
+### 3. Checksums glob could match unexpected files
+
+**File:** `.github/workflows/release.yml`, line 41
+
+The command `cd bin && shasum -a 256 mactop-darwin-* > checksums.txt` uses a glob that would match any file starting with `mactop-darwin-`. If a future change adds files like `mactop-darwin-arm64.tar.gz` or `mactop-darwin-arm64.sig` to the `bin/` directory, they would be silently included in the checksums. More importantly, if both build steps fail silently (producing no output files), the glob expands to the literal string `mactop-darwin-*`, and `shasum` will fail with "No such file or directory" -- which is actually a good fail-safe behavior. However, the error message would be confusing.
+
+**Suggested fix:** Be explicit about which files are checksummed:
+
+```yaml
+- name: Generate checksums
+  run: |
+    cd bin
+    shasum -a 256 mactop-darwin-arm64 mactop-darwin-amd64 > checksums.txt
+```
+
+This makes it immediately clear which files are included and will produce a clear error if either binary is missing.
+
+### 4. `draft: false` and `prerelease: false` are redundant defaults
+
+**File:** `.github/workflows/release.yml`, lines 49-50
+
+Both `draft: false` and `prerelease: false` are the default values for `softprops/action-gh-release`. Including them adds visual noise without changing behavior. The architecture doc (Section 14.6) notes that prerelease detection was intentionally skipped, so the explicit `prerelease: false` does serve as documentation of that decision -- but a YAML comment would communicate the intent better than a redundant configuration value.
+
+**Suggested fix:** Remove both lines, or keep `prerelease: false` with a comment explaining it is intentional:
+
+```yaml
+# All tags are stable releases; prerelease detection intentionally skipped.
+prerelease: false
+```
+
+### 5. No `go test` step before building
+
+**File:** `.github/workflows/release.yml`
+
+The workflow builds and releases binaries without running any tests. The architecture doc (Section 14.10) acknowledges this and explains that tests require macOS-specific hardware access. However, the project does have 97 tests (per the project plan), and they are running on macOS. At minimum, the pure Go tests (ring buffer, sparkline, layout, formatting) should pass before a release is published.
+
+If some tests require hardware access that is unavailable on GitHub runners, those can be tagged with `//go:build !ci` or skipped with `testing.Short()`. But publishing a release without running any tests is a risk -- a tag could be pushed from a commit that breaks compilation of test files (which would not be caught by the build step alone) or introduces a regression in core logic.
+
+**Suggested fix:** Add a test step before the build steps:
+
+```yaml
+- name: Run tests
+  run: go test ./...
+```
+
+If specific tests fail on CI runners, address those individually rather than skipping all tests.
+
+---
+
+## Nits
+
+### 6. `tag_name` is redundant when triggered by a tag push
+
+**File:** `.github/workflows/release.yml`, line 46
+
+When `softprops/action-gh-release` runs on a `push: tags` event, it automatically uses `github.ref_name` as the tag. The explicit `tag_name: ${{ github.ref_name }}` is not wrong, but it duplicates the default behavior. Removing it would slightly simplify the configuration.
+
+### 7. Consider adding a concurrency group to prevent duplicate releases
+
+If a tag is deleted and re-pushed quickly, two workflow runs could race. Adding a concurrency group would cancel the first run:
+
+```yaml
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
+```
+
+This is a minor edge case but easy to guard against.
+
+### 8. The `go-version-file: go.mod` approach is good but worth noting a subtlety
+
+**File:** `.github/workflows/release.yml`, line 23
+
+`actions/setup-go@v5` reads the `go X.Y.Z` directive from `go.mod`. This is the correct approach -- it keeps the CI Go version in sync with the project's declared version. However, `go.mod` currently specifies `go 1.24.0` (with the patch version). If the `go.mod` is ever updated to just `go 1.24` (without the patch), `setup-go` will install the latest patch release of 1.24.x, which is generally fine but worth being aware of.
+
+This is not an issue to fix -- just a note for awareness.
+
+---
+
+## Positive Observations
+
+- **Single-job approach is correct for this project.** The architecture doc explains the trade-off well: a matrix would add artifact-passing complexity for negligible time savings on a fast Go build. The sequential approach is simpler and avoids race conditions on release creation.
+- **Version injection is clean.** The `${GITHUB_REF_NAME#v}` shell parameter expansion correctly strips the `v` prefix, matching the convention in `main.go` where `version` is stored without the prefix and the UI prepends `v` for display.
+- **`GITHUB_ENV` usage is correct.** Writing `VERSION=...` to `$GITHUB_ENV` makes it available as `$VERSION` in all subsequent steps. This is the proper mechanism (not `set-output`, which is deprecated).
+- **Permissions are correctly scoped.** `contents: write` at the workflow level is the minimum required permission for creating releases and uploading assets. The workflow does not request broader permissions like `packages: write` or `actions: write`.
+- **The `go-version-file` approach prevents version drift.** Rather than hardcoding `go-version: '1.24'`, reading from `go.mod` ensures the CI always uses the same Go version the project declares.
+- **Build flags are consistent with the Makefile.** The `-ldflags "-s -w -X main.version=..."` flags in the workflow match the Makefile's `LDFLAGS`, ensuring release binaries are built the same way as local builds.
+
+---
+
+## Final Verdict
+
+**Approve with changes.** The workflow is functionally correct and will produce valid releases. The must-fix item (SHA pinning for the third-party action, #1) is a supply-chain security concern that should be addressed before the workflow runs in production with write permissions. The should-fix items are about robustness (explicit checksums, removing unnecessary full clone) and quality gates (running tests before release). None of the issues would cause incorrect binaries to be produced -- the workflow will either succeed correctly or fail visibly.
+
+---
+
+# Re-Review: GitHub Actions Release Workflow (Post-Fix)
+
+**Date:** 2026-03-30
+**Reviewer:** Claude Opus 4.6
+**Scope:** `.github/workflows/release.yml` -- verifying resolution of five issues from the previous review.
+**Verdict:** Approve
+
+---
+
+## Previous Issue Resolution
+
+### Issue 1: Actions should be pinned to commit SHAs (was Must Fix) -- RESOLVED
+
+All three actions are now pinned to full 40-character commit SHAs with version comments for readability:
+
+- `actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2` (line 15)
+- `actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0` (line 18)
+- `softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.3.2` (line 41)
+
+The version comments are present and the SHAs are the correct length. The versions have also been bumped from the suggested values in the original review (v4.1.7 -> v4.2.2, v5.4.0 -> v5.5.0, v2.2.1 -> v2.3.2), which suggests these were looked up fresh rather than blindly copied.
+
+### Issue 2: Permissions should be job-level, not workflow-level (was Medium) -- RESOLVED
+
+The `permissions` block is now at job level (lines 11-12, nested under `jobs: release:`) rather than at the workflow top level. This is the correct placement -- if additional jobs were added to this workflow in the future, they would not inherit write permissions by default.
+
+### Issue 3: `fetch-depth: 0` should be removed (was Low) -- RESOLVED
+
+The checkout step (lines 14-15) has no `with:` block at all, which means it uses the default `fetch-depth: 1` (shallow clone). This is correct -- the workflow does not need full Git history.
+
+### Issue 4: Redundant defaults (`draft`, `prerelease`, `tag_name`) should be removed (was Nit) -- RESOLVED
+
+The release step's `with:` block (lines 42-48) no longer contains `draft: false`, `prerelease: false`, or `tag_name: ${{ github.ref_name }}`. Only the meaningful configuration remains: `name`, `generate_release_notes`, and `files`. This is cleaner and avoids visual noise from redundant defaults.
+
+### Issue 5: Checksums should use explicit filenames, not glob (was Low) -- RESOLVED
+
+Line 38 now reads:
+
+```
+cd bin && shasum -a 256 mactop-darwin-arm64 mactop-darwin-amd64 > checksums.txt
+```
+
+The glob `mactop-darwin-*` has been replaced with the two explicit binary names. This prevents accidental inclusion of unexpected files and will produce a clear error if either binary is missing.
+
+---
+
+## New Issues Found
+
+### Should Fix
+
+#### 1. No `go test` step before building release binaries
+
+**File:** `.github/workflows/release.yml`
+
+This was raised as item #5 in the original review (separate from the five issues being re-verified here) and remains unaddressed. The workflow builds and publishes binaries without running any tests. A `go test ./...` step before the build steps would catch compilation failures in test files and regressions in pure Go logic (ring buffer, sparkline, formatting) before artifacts are published to a release.
+
+This is carried forward as a should-fix, not a blocker, since it does not affect the correctness of the five fixes being verified.
+
+### Nits
+
+#### 2. Consider adding a concurrency group
+
+Also carried forward from the original review (item #7). A `concurrency` block would prevent duplicate release runs if a tag is deleted and re-pushed quickly. Low priority but easy to add.
+
+---
+
+## Final Verdict
+
+**Approve.** All five previously identified issues have been properly resolved. The SHA pinning uses current action versions with correct formatting. The permissions are correctly scoped at job level. The unnecessary `fetch-depth: 0` and redundant configuration defaults have been removed. The checksums step uses explicit filenames. The workflow is ready for production use. The remaining should-fix (adding a test step) is a pre-existing item that does not block this approval.

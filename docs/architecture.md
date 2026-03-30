@@ -860,6 +860,218 @@ No other third-party dependencies. All macOS API access is via CGo and system he
 
 ---
 
+## 14. CI/CD: GitHub Actions Release Workflow
+
+### 14.1 Overview
+
+A single GitHub Actions workflow builds and releases `mactop` binaries for both macOS architectures whenever a version tag is pushed. Because the project requires CGO with macOS frameworks (IOKit, CoreFoundation), all builds must run on macOS runners -- Linux cross-compilation is not possible.
+
+```
+  git tag v1.2.3 && git push --tags
+           |
+           v
+  +----------------------------+
+  | GitHub Actions triggers    |
+  | on: push tags "v*"        |
+  +----------------------------+
+           |
+           v
+  +----------------------------+
+  | Job: release               |
+  | runs-on: macos-latest      |
+  +----------------------------+
+           |
+           v
+  +--------+--------+
+  |                 |
+  v                 v
+  Build arm64     Build amd64
+  (GOARCH=arm64)  (GOARCH=amd64)
+  |                 |
+  v                 v
+  mactop-darwin-   mactop-darwin-
+  arm64            amd64
+  |                 |
+  +--------+--------+
+           |
+           v
+  +----------------------------+
+  | Create GitHub Release      |
+  | Attach both binaries       |
+  +----------------------------+
+```
+
+### 14.2 Workflow File
+
+**Path**: `.github/workflows/release.yml`
+**Name**: `Release`
+
+### 14.3 Trigger
+
+```
+on:
+  push:
+    tags:
+      - "v*"
+```
+
+This fires only when a tag matching `v*` is pushed (e.g., `v0.1.0`, `v1.2.3`, `v2.0.0-rc.1`). It does NOT trigger on branch pushes or pull requests.
+
+### 14.4 Job Structure: Single Job, Sequential Builds
+
+**Decision**: Use a single job with sequential build steps rather than a matrix strategy.
+
+**Rationale**:
+- A matrix would create two separate jobs, each needing its own checkout and Go setup -- overhead for a build that takes seconds.
+- Both binaries must be collected into one release. With a matrix, this requires either a separate "create release" job with artifact passing, or a race condition if both jobs try to create the release. A single job avoids this entirely.
+- The total build time for both architectures is under 2 minutes. The simplicity of a single job outweighs the ~30 seconds saved by parallel matrix builds.
+
+**Trade-off**: If build times grow significantly (unlikely for a single-binary Go project), this can be converted to a matrix with a downstream release job. For now, simplicity wins.
+
+### 14.5 Job Definition
+
+**Job name**: `release`
+**Runner**: `macos-latest` (GitHub-hosted; provides Xcode CLI tools, which supply the C headers and frameworks needed for CGO)
+**Permissions**: `contents: write` (required to create releases and upload assets via the GitHub API)
+
+### 14.6 Steps (in order)
+
+#### Step 1: Checkout
+
+- **Action**: `actions/checkout@v4`
+- **Config**: `fetch-depth: 0` (full history, so tag metadata is available)
+- **Purpose**: Clone the repo at the tagged commit.
+
+#### Step 2: Set up Go
+
+- **Action**: `actions/setup-go@v5`
+- **Config**: Read Go version from `go.mod` (`go-version-file: go.mod`)
+- **Purpose**: Install the correct Go version (currently 1.24). Reading from `go.mod` means the workflow never drifts from the project's Go version.
+
+#### Step 3: Extract version from tag
+
+- **Command**: Strip the `v` prefix from `GITHUB_REF_NAME` and store in `GITHUB_ENV`.
+  ```
+  echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+  ```
+- **Example**: Tag `v1.2.3` produces `VERSION=1.2.3`. This matches the Makefile convention where `main.version` is set to `1.2.3` (without the `v` prefix), and the application itself prepends `v` in its output (`mactop v1.2.3`).
+- **Stored as**: Environment variable `VERSION`, available to all subsequent steps.
+
+#### Step 4: Build arm64 binary
+
+- **Command**:
+  ```
+  CGO_ENABLED=1 GOARCH=arm64 GOOS=darwin \
+    go build -ldflags "-s -w -X main.version=$VERSION" \
+    -o bin/mactop-darwin-arm64 ./cmd/mactop
+  ```
+- **Notes**:
+  - `CGO_ENABLED=1` is mandatory (IOKit/CoreFoundation access).
+  - `-s -w` strips debug info and DWARF symbols for smaller binaries.
+  - `-X main.version=$VERSION` injects the version from Step 3.
+  - Output goes to `bin/mactop-darwin-arm64`.
+  - `macos-latest` runners are Apple Silicon (arm64), so this is a native build.
+
+#### Step 5: Build amd64 binary
+
+- **Command**:
+  ```
+  CGO_ENABLED=1 GOARCH=amd64 GOOS=darwin \
+    go build -ldflags "-s -w -X main.version=$VERSION" \
+    -o bin/mactop-darwin-amd64 ./cmd/mactop
+  ```
+- **Notes**:
+  - This is a cross-architecture CGO build (arm64 host building for amd64). This works because Apple's toolchain supports both architectures natively via the `-arch x86_64` flag, and Go's CGO integration on macOS handles this transparently when `GOARCH=amd64` is set.
+  - If this cross-compile fails in practice (unlikely but possible with specific CGO configurations), the fallback is to use a matrix with `macos-13` (Intel) for the amd64 build and `macos-latest` (Apple Silicon) for arm64. See Section 14.9.
+
+#### Step 6: Create GitHub Release and upload assets
+
+- **Action**: `softprops/action-gh-release@v2`
+- **Config**:
+  - `tag_name`: `${{ github.ref_name }}` (the full tag, e.g., `v1.2.3`)
+  - `name`: `mactop ${{ github.ref_name }}` (release title, e.g., `mactop v1.2.3`)
+  - `generate_release_notes`: `true` (auto-generates changelog from commits since last tag)
+  - `files`: `bin/mactop-darwin-arm64` and `bin/mactop-darwin-amd64`
+  - `draft`: `false`
+  - `prerelease`: auto-detect based on tag (tags containing `-rc`, `-beta`, `-alpha` should be marked as prerelease; `softprops/action-gh-release` does not do this automatically, so either set `prerelease: ${{ contains(github.ref_name, '-') }}` or leave as `false` for simplicity)
+
+**Why `softprops/action-gh-release`**: It is the most widely used release action, handles both release creation and asset upload in one step, and supports `generate_release_notes`. The alternative (`gh release create` via CLI) also works but requires more scripting. Either approach is fine; the action is slightly cleaner.
+
+**Alternative approach using `gh` CLI**:
+```
+gh release create "$GITHUB_REF_NAME" \
+  --title "mactop $GITHUB_REF_NAME" \
+  --generate-notes \
+  bin/mactop-darwin-arm64 \
+  bin/mactop-darwin-amd64
+```
+This would use the `GITHUB_TOKEN` already available in the runner environment. The `gh` CLI approach has no external action dependency and is simpler to audit. If the team prefers minimal action dependencies, use this instead of `softprops/action-gh-release`.
+
+### 14.7 Permissions and Tokens
+
+- **`contents: write`**: Must be declared at the job or workflow level. Required for creating releases and uploading assets.
+- **`GITHUB_TOKEN`**: Automatically provided by GitHub Actions. No personal access tokens or secrets needed.
+- The `softprops/action-gh-release` action (or `gh` CLI) uses `GITHUB_TOKEN` by default.
+
+### 14.8 Complete Step Summary
+
+```
+Job: release
+  runs-on: macos-latest
+  permissions: contents: write
+
+  Steps:
+  1. actions/checkout@v4          (fetch-depth: 0)
+  2. actions/setup-go@v5          (go-version-file: go.mod)
+  3. Extract VERSION from tag     (shell: echo)
+  4. Build arm64 binary           (go build, GOARCH=arm64)
+  5. Build amd64 binary           (go build, GOARCH=amd64)
+  6. Create release + upload      (softprops/action-gh-release@v2 OR gh CLI)
+```
+
+### 14.9 Edge Cases and Failure Modes
+
+| Scenario | Impact | Mitigation |
+|----------|--------|------------|
+| amd64 CGO cross-compile fails on arm64 runner | No Intel binary produced | Fallback: use a matrix with `macos-13` (Intel runner) for amd64. See note below. |
+| Tag pushed without matching code changes | Empty or broken release | No mitigation needed -- this is a human process issue. The build either succeeds or fails cleanly. |
+| `macos-latest` runner changes OS version | Build behavior may change | Pin to `macos-15` if stability is critical. Currently `macos-latest` maps to macOS 14 (Sonoma) / 15 (Sequoia). The project targets macOS 13+, so forward compatibility is expected. |
+| Go version in `go.mod` not available in `setup-go` | Setup step fails | `setup-go@v5` supports Go 1.24. Only a risk if upgrading to a very new Go version before the action supports it. |
+| `softprops/action-gh-release` has a breaking change | Release step fails | Pin to `@v2`. Alternatively, use `gh release create` which has no external dependency. |
+| Tag format is not semver (e.g., `vabc`) | VERSION env var is `abc`, build succeeds but version string is wrong | Document that tags must follow `vX.Y.Z` format. No automated enforcement needed -- the build will still work, just with a non-standard version string. |
+| Release already exists for tag (re-push) | `gh-release` action fails with conflict | Either delete the existing release first, or do not re-push tags. If re-releases are needed, delete the release and tag, then re-tag. |
+| Xcode CLI tools missing on runner | CGO compilation fails (missing headers) | GitHub-hosted macOS runners always include Xcode CLI tools. Only a risk with self-hosted runners. |
+
+**Fallback matrix strategy** (if amd64 cross-compile proves unreliable):
+
+If Step 5 (amd64 build on an arm64 runner) fails due to CGO cross-compilation issues, restructure as:
+
+```
+Job: build (matrix)
+  strategy:
+    matrix:
+      include:
+        - goarch: arm64
+          runner: macos-latest
+        - goarch: amd64
+          runner: macos-13
+  Steps: checkout, setup-go, build, upload-artifact
+
+Job: release (needs: build)
+  Steps: download-artifacts, create-release
+```
+
+This adds complexity (artifact passing between jobs, two runners) but guarantees native builds for each architecture. Only adopt this if the simpler single-job approach fails.
+
+### 14.10 What the Workflow Does NOT Cover
+
+- **Testing**: No `go test` step is included because the project's tests require macOS-specific hardware access (SMC, IOKit). A separate CI workflow for testing on PRs could be added later if needed, but is out of scope for the release workflow.
+- **Code signing / notarization**: The binaries are not signed or notarized. macOS Gatekeeper will flag them on first run. Users will need to right-click and Open, or run `xattr -cr mactop-darwin-*`. If distribution grows, add a signing step using a Developer ID certificate stored as a GitHub secret.
+- **Homebrew formula**: No automatic Homebrew tap update. This can be added as a post-release step later (e.g., `mislav/bump-homebrew-formula-action`).
+- **Checksums**: No SHA256 checksums file is generated. Add one if users request verification. (Simple addition: `shasum -a 256 bin/* > bin/checksums.txt` and attach to release.)
+
+---
+
 ## Appendix A: Reference Projects
 
 These open-source projects use similar techniques and serve as implementation references:

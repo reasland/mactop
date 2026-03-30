@@ -37,3 +37,21 @@ A CLI program that displays real-time macOS system metrics including CPU, GPU, m
 | 23 | QA & testing | qa-engineer | ✅ Complete (97 tests pass) |
 
 ## Status: Phase 2 ✅ COMPLETE
+
+## Phase 3: GitHub Actions Build & Release Pipeline
+
+| # | Task | Owner | Status | Dependencies |
+|---|------|-------|--------|--------------|
+| 24 | Design pipeline architecture | architect | ✅ Complete | - |
+| 25 | Implement workflow YAML | implementer | ✅ Complete | 24 |
+| 26 | Code review | code-reviewer | ✅ Approved | 25 |
+| 27 | Security review | security-engineer | ✅ Approved | 26 |
+| 28 | Review fixes applied | implementer | ✅ Complete | 26, 27 |
+| 29 | Re-review | code-reviewer | ✅ Approved | 28 |
+
+### Constraints
+- GitHub-hosted `macos-latest` runners (CGO + macOS frameworks required)
+- Trigger only on version tags (`v*`) to minimize runner minute usage
+- GitHub spending limit at $0 — no surprise charges
+- Build arm64 and amd64 binaries
+- Publish binaries as GitHub Release assets

@@ -54,3 +54,11 @@
 - **QA**: 60/60 tests passing (30 new), 1 bug found and fixed (max initialization)
 - **All fixes applied**: build OK, tests OK, vet OK
 - **Status**: ✅ All critical/major issues resolved
+
+## 2026-03-30 — Phase 3: GitHub Actions Release Pipeline Complete
+- **Design**: Architect designed single-job workflow on macos-latest, triggered on v* tags
+- **Implementation**: `.github/workflows/release.yml` created
+- **Code review**: Approved with 5 fixes (SHA pinning, job-level perms, remove defaults, explicit checksums, remove fetch-depth)
+- **Security review**: High-severity SHA pinning fixed; medium items (tag-to-branch check, SLSA provenance) deferred as low risk for personal project
+- **All fixes applied and re-reviewed**: ✅ Approved
+- **Status**: ✅ Ready to use — push a `v*` tag to create a release

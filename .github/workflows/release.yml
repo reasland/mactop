@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Extract version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build arm64 binary
+        run: |
+          CGO_ENABLED=1 GOARCH=arm64 GOOS=darwin \
+            go build -ldflags "-s -w -X main.version=$VERSION" \
+            -o bin/mactop-darwin-arm64 ./cmd/mactop
+
+      - name: Build amd64 binary
+        run: |
+          CGO_ENABLED=1 GOARCH=amd64 GOOS=darwin \
+            go build -ldflags "-s -w -X main.version=$VERSION" \
+            -o bin/mactop-darwin-amd64 ./cmd/mactop
+
+      - name: Generate checksums
+        run: cd bin && shasum -a 256 mactop-darwin-arm64 mactop-darwin-amd64 > checksums.txt
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.3.2
+        with:
+          name: mactop ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            bin/mactop-darwin-arm64
+            bin/mactop-darwin-amd64
+            bin/checksums.txt

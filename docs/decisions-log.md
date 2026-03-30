@@ -64,3 +64,20 @@
 - **HID name caching**: Cache sensor names after first read, skip CGo calls on subsequent ticks (Performance)
 - **Dead code removal**: Removed unused `initialized` field (Code review)
 - **Private API risks accepted**: IOHIDEventSystem extern declarations are inherently fragile; accepted as necessary for macOS 26 temp support
+
+## 2026-03-30 — GitHub Actions: Use macos-latest runners
+- **Decision**: Use GitHub-hosted `macos-latest` runners instead of self-hosted `arc-runner-set`
+- **Rationale**: Project requires CGO with macOS frameworks (IOKit, CoreFoundation). Cross-compilation from Linux is impractical. macOS minutes cost 10x but free tier covers ~40-60 builds/month.
+- **Made by**: User + PM
+
+## 2026-03-30 — GitHub Actions: Implementation choices
+- **Release action**: Use `softprops/action-gh-release@v2` — cleanest single-step for release creation + asset upload
+- **Prerelease detection**: Skip — all tags are stable releases, keep it simple
+- **Checksums**: Yes — generate SHA256 checksums.txt and attach to release (one-liner, standard practice)
+- **amd64 build**: Single-job cross-compile on arm64 runner first; fallback to matrix with macos-13 only if it fails
+- **Made by**: PM (user deferred to cleanest option)
+
+## 2026-03-30 — GitHub Actions: Trigger on version tags only
+- **Decision**: Pipeline triggers only on `v*` tags, not on every push
+- **Rationale**: Minimizes macOS runner minute usage. Spending limit stays at $0 — no surprise charges.
+- **Made by**: User + PM

@@ -423,3 +423,30 @@ The temperature graph had inline max-finding and scaling logic identical to `aut
 
 - `internal/ui/panels.go` -- renamed function, added floor parameter, refactored temperature graph to call it
 - `internal/ui/panels_test.go` -- updated all `autoScaleMax` test calls to `autoScaleMaxWithFloor(..., 1024)`
+
+---
+
+## GitHub Actions Release Workflow (2026-03-30)
+
+Added `.github/workflows/release.yml` -- a GitHub Actions workflow that builds and publishes macOS binaries when a version tag (`v*`) is pushed.
+
+### Files added
+
+- **`.github/workflows/release.yml`** -- Single-job workflow named `Release` that runs on `macos-latest`. Builds arm64 and amd64 Darwin binaries with version injected via `-ldflags`, generates SHA-256 checksums, and creates a GitHub release with auto-generated notes using `softprops/action-gh-release@v2`.
+
+### How to trigger
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+### Assumptions
+
+- The `main.version` variable exists in `cmd/mactop/main.go` and is set via `-X main.version=...` ldflags at build time.
+- Cross-compilation from arm64 to amd64 (or vice versa) works on `macos-latest` GitHub runners with `CGO_ENABLED=1`. GitHub's macOS runners are Apple Silicon (M1+) as of late 2024.
+
+### Limitations
+
+- Only builds macOS (darwin) binaries. Linux is not supported since the project depends on macOS-specific frameworks (IOKit, CoreFoundation).
+- The amd64 cross-compilation with CGO requires the appropriate SDK support on the runner. If GitHub changes the runner image, this may need adjustment.
